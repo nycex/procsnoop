@@ -20,5 +20,5 @@ jobs:
         id: mirror
         uses: bridgelightcloud/github-mirror-action@v3
         with:
-          origin: ''
+          origin: 'https://codeberg.org/nycex/procsnoop'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
