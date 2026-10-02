@@ -136,3 +136,5 @@ missed. Each event is matched against the tracked tree:
 - `-T` additionally hides a process once an ancestor's start line has been
   printed, so you see the first command in each chain but not its children.
 
+## License
+[GPL-3.0](LICENSE) © 2026 nycex
