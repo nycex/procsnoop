@@ -8,6 +8,8 @@ mostly "vibecoded" version of `{exec,exit}snoop` featuring (non-exhaustive):
 - get FORK, EXEC and EXIT events (and see how long proc ran until EXIT) in a single chronological output
 - select which events to output
 
+[![AUR](https://img.shields.io/badge/AUR-procsnoop-1793D1?style=for-the-badge&logo=archlinux)](https://aur.archlinux.org/packages/procsnoop)
+
 ## requirements
 
 - Linux **5.8 or newer** (BPF ring buffer).
