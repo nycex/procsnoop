@@ -1,0 +1,268 @@
+.\" procsnoop(8) - trace process fork/exec/exit, filtered by process subtree
+.TH PROCSNOOP 8 "October 2026" "procsnoop" "System Manager's Manual"
+.SH NAME
+procsnoop \- trace process fork/exec/exit, filtered by process subtree
+.SH SYNOPSIS
+.B procsnoop
+.RI [ options ]
+.SH DESCRIPTION
+.B procsnoop
+traces process creation, execution and termination system\-wide, and prints the
+events filtered by process lineage.
+It attaches to the kernel's
+.BR sched_process_fork ,
+.BR sched_process_exec
+and
+.BR sched_process_exit
+tracepoints using eBPF (through the BCC framework), reconstructs the process
+tree in user space, and decides for each event whether the subject process
+belongs to a selected subtree.
+.PP
+A
+.I root
+is a process selected with
+.B \-P
+or by a pattern
+.RB ( \-m , \-f , \-X ).
+By default,
+.B procsnoop
+hides each root together with everything descended from it; with
+.B \-o
+it prints only those subtrees instead.
+.PP
+Because the tree is reconstructed from tracepoints rather than sampled from
+.IR /proc ,
+a process stays attributed to its ancestors even if intermediate processes
+never
+.BR exec (2)
+(for example subshells), exit early, or are reparented.
+.PP
+.B procsnoop
+must run as root.
+When started by an unprivileged user it re\-executes itself through
+.BR sudo (8),
+unless
+.B \-\-no\-sudo
+is given.
+.SH OPTIONS
+.SS Root selection
+.PP
+.B \-P
+and the pattern options can be combined; a process is a root if it matches any
+of them.
+.TP
+.B \-P, \-\-pid PID[,PID...]
+Roots: PID(s) whose subtree is hidden (or, with
+.BR \-o ,
+shown).
+The argument is a comma\-separated list; the option is repeatable.
+.TP
+.B \-m, \-\-match PATTERN
+Roots: processes whose name (the kernel
+.IR comm ,
+at most 15 characters) matches, like
+.BR pgrep .
+.TP
+.B \-f, \-\-match\-full PATTERN
+Roots: processes whose command line (arguments joined by spaces) matches, like
+.B pgrep \-f .
+.TP
+.B \-X, \-\-match\-exe PATTERN
+Roots: processes whose executable matches.
+The value tested is the loaded binary
+.RI ( /proc/ PID /exe,
+or the interpreter for scripts), not the script path.
+.TP
+.B \-F, \-\-fixed\-strings
+Treat patterns as literal strings rather than regular expressions.
+.TP
+.B \-x, \-\-exact
+Require patterns to match the whole value, like
+.B pgrep \-x .
+.TP
+.B \-i, \-\-ignore\-case
+Match patterns case\-insensitively.
+.TP
+.B \-o, \-\-only
+Invert the selection: print only the selected subtrees instead of hiding them.
+.TP
+.B \-r, \-\-roots
+Count the root processes themselves as part of their subtrees.
+This is the default.
+.TP
+.B \-R, \-\-no\-roots
+Filter only the descendants; the roots are treated like any other process.
+.SS Output
+.TP
+.B \-e, \-\-events EV[,EV...]
+Events to print:
+.BR FORK ,
+.BR EXEC ,
+.B EXIT
+or
+.BR ALL .
+The default is
+.BR EXEC,EXIT .
+All three event types are always traced internally, regardless of this option.
+.TP
+.B \-T, \-\-top\-level
+Print only processes none of whose ancestors were printed (scripts and
+programs, not their subprocesses).
+Interactive shells do not count as printed ancestors.
+.TP
+.B \-\-strict
+With
+.BR \-T ,
+count interactive shells as printed ancestors too, so any session opened after
+startup hides everything run in it.
+.TP
+.B \-\-paired
+Print an
+.B EXIT
+event only for processes whose
+.B FORK
+or
+.B EXEC
+line was printed.
+This is the default whenever
+.B \-\-events
+allows it.
+.TP
+.B \-\-no\-paired
+Print every
+.B EXIT
+event that passes the filters.
+.TP
+.B \-\-show\-hidden
+Also print filtered lines, dimmed and marked with an asterisk.
+Intended for debugging.
+.TP
+.B \-t, \-\-time {wall,rel,none}
+Select the timestamp column:
+.B wall
+is
+.IR HH:MM:SS.mmm ,
+.B rel
+is the number of seconds since the trace started, and
+.B none
+omits the column.
+The default is
+.BR wall .
+.TP
+.B \-U, \-\-uid
+Add a UID column.
+.TP
+.B \-M, \-\-pcomm
+Add a column with the parent's name, taken from the tracked tree so it works
+even for parents that have already exited.
+.TP
+.B \-\-exe
+Show the loaded binary when it differs from
+.IR argv[0] .
+.TP
+.B \-\-color [{auto,always,never}]
+Colorize the output.
+The default is
+.BR auto ,
+which enables color only when writing to a terminal.
+.TP
+.B \-\-no\-header
+Do not print the column header.
+.SS Tuning
+.TP
+.B \-\-arg\-bytes N
+Maximum number of bytes of
+.I argv
+captured per
+.BR exec .
+Must be a power of two between 256 and 16384; the default is 4096.
+Larger values capture more of long command lines.
+.TP
+.B \-\-buffer\-pages N
+Size of the BPF ring buffer in pages.
+Must be a power of two between 16 and 65536; the default is 1024 (4\ MiB).
+.TP
+.B \-\-no\-sudo
+Do not re\-run through
+.BR sudo (8)
+when not root; fail instead.
+.SS Miscellaneous
+.TP
+.B \-h, \-\-help
+Print a usage message and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+Normal termination.
+This includes termination by
+.B SIGINT
+or
+.BR SIGTERM ,
+which stop the trace cleanly.
+.TP
+.B 2
+Command\-line usage error.
+.TP
+.B 1
+Fatal error (for example the BCC Python module is missing, the process is not
+running as root with
+.BR \-\-no\-sudo ,
+or a requested PID does not exist).
+.SH EXAMPLES
+.TP
+.B procsnoop \-T
+Print only top\-level commands, not their subprocesses.
+.TP
+.B procsnoop \-T \-\-strict
+Like
+.BR \-T ,
+but sessions opened after startup are covered too.
+.TP
+.B procsnoop \-P 1234,5678
+Hide processes 1234 and 5678 and everything below them.
+.TP
+.B procsnoop \-P "$(pgrep \-d, \-x sshd)" \-e all
+Hide sshd and its subtree, printing all three event types.
+.TP
+.B procsnoop \-o \-P 4242
+Show only process 4242 and its subtree.
+.TP
+.B procsnoop \-P 2 \-e all
+Hide kernel threads (kthreadd's subtree).
+.TP
+.B procsnoop \-m '^(chrome|code)$'
+Hide Chrome and VS Code and everything they start.
+.TP
+.B procsnoop \-o \-f 'make .*\-j' \-T
+Show only the
+.B make \-j...
+invocations themselves.
+.TP
+.B procsnoop \-F \-\-exact \-X /usr/bin/python3.12
+Match the interpreter path literally and exactly.
+.SH NOTES
+.B procsnoop
+requires Linux 5.8 or newer (for the BPF ring buffer) and the BCC Python module
+.RI ( python3\-bpfcc
+on Debian/Ubuntu,
+.B python3\-bcc
+on Fedora,
+.B python\-bcc
+on Arch).
+.PP
+If the ring buffer overflows, events are lost and a warning is printed;
+the reported lineage may then be incomplete.
+Increase
+.B \-\-buffer\-pages
+to reduce the chance of this.
+.PP
+Process names and command\-line arguments are attacker\-controlled; control
+characters are escaped before they reach the terminal.
+.SH SEE ALSO
+.BR pgrep (1),
+.BR ps (1),
+.BR top (1),
+.BR sudo (8),
+.BR bpftrace (8),
+.BR execsnoop (8)
+

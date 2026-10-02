@@ -1,0 +1,953 @@
+#!/usr/bin/env python3
+"""procsnoop - trace process fork/exec/exit system-wide, hiding (or showing only)
+the process subtrees of given PIDs or of processes matching pgrep-like patterns,
+optionally printing only top-level processes (no subprocesses of printed ones).
+
+The process tree is tracked from the kernel's sched_process_{fork,exec,exit}
+tracepoints, so a process stays attributed to its ancestors even if
+intermediate processes never exec (subshells), exit early, or get reparented.
+
+Requires root (re-runs itself via sudo), BCC's Python module
+(python3-bpfcc / python3-bcc) and Linux >= 5.8 (BPF ring buffer).
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes as ct
+import importlib.util
+import os
+import re
+import shlex
+import shutil
+import signal
+import sys
+import time
+from collections.abc import Callable, Iterable, Iterator
+from typing import NamedTuple, NoReturn
+
+PROG = "procsnoop"
+EXAMPLES = """\
+examples:
+  procsnoop.py -T                       # only top-level commands, not their subprocesses
+  procsnoop.py -T --strict              # -T, but sessions opened later are covered too
+  procsnoop.py -P 1234,5678             # hide 1234, 5678 and everything below them
+  procsnoop.py -P "$(pgrep -d, -x sshd)" -e all
+  procsnoop.py -o -P 4242               # show ONLY 4242 and its subtree
+  procsnoop.py -P 2 -e all              # hide kernel threads (kthreadd's subtree)
+  procsnoop.py -m '^(chrome|code)$'     # hide Chrome/VS Code and everything they start
+  procsnoop.py -o -f 'make .*-j' -T     # only the `make -j...` invocations themselves
+  procsnoop.py -F --exact -X /usr/bin/python3.12
+"""
+BCC_MISSING = (f"{PROG}: BCC Python module not found "
+               "(Debian/Ubuntu: python3-bpfcc, Fedora: python3-bcc, Arch: python-bcc)")
+
+EV_FORK, EV_EXEC, EV_EXIT = 1, 2, 3
+EVENT_BY_NAME = {"FORK": EV_FORK, "EXEC": EV_EXEC, "EXIT": EV_EXIT}
+EVENT_LABEL = {v: k for k, v in EVENT_BY_NAME.items()}
+TASK_COMM_LEN = 16
+BINARY_LEN = 256
+DEAD_STATES = ("Z", "X", "x")
+F_TTY_LEADER = 1  # header flag: session leader with a controlling terminal
+
+# --------------------------------------------------------------------------- BPF
+
+BPF_PROGRAM = r"""
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/mm_types.h>
+#include <linux/binfmts.h>
+
+#define EV_FORK 1
+#define EV_EXEC 2
+#define EV_EXIT 3
+#define F_TTY_LEADER 1
+#define ARGSIZE __ARGSIZE__
+#define BINARY_LEN 256
+
+struct hdr_t {
+    u64 ts;            /* bpf_ktime_get_ns(), CLOCK_MONOTONIC */
+    u64 start_ns;      /* process start time, same clock */
+    u32 type;
+    u32 pid;           /* tgid of the subject (the child, for FORK) */
+    u32 ppid;          /* FORK: creating process; else tgid of real_parent */
+    u32 uid;
+    s32 exit_code;     /* wait()-style status */
+    u32 flags;         /* EXEC: F_TTY_LEADER */
+    char comm[TASK_COMM_LEN];
+};
+
+struct exec_t {
+    struct hdr_t h;
+    u32 args_len;      /* bytes copied into args */
+    u32 args_total;    /* full size of the argv area */
+    char binary[BINARY_LEN];  /* bprm->interp: the binary actually loaded */
+    char args[ARGSIZE];
+};
+
+BPF_RINGBUF_OUTPUT(events, __PAGES__);
+BPF_ARRAY(dropped, u64, 1);
+BPF_PERCPU_ARRAY(exec_scratch, struct exec_t, 1);
+/* tgids whose EXIT was already reported (deduplicates concurrent thread exits) */
+BPF_TABLE("lru_hash", u32, u8, exited, 65536);
+
+static __always_inline void count_drop(void)
+{
+    int zero = 0;
+    dropped.atomic_increment(zero);
+}
+
+static __always_inline void fill(struct hdr_t *h, struct task_struct *t, u32 type)
+{
+    struct task_struct *parent = NULL;
+
+    h->ts = bpf_ktime_get_ns();
+    h->type = type;
+    h->uid = (u32)bpf_get_current_uid_gid();
+    h->pid = h->ppid = 0;
+    h->start_ns = 0;
+    h->exit_code = 0;
+    h->flags = 0;
+    bpf_probe_read_kernel(&h->pid, sizeof(h->pid), &t->tgid);
+    bpf_probe_read_kernel(&parent, sizeof(parent), &t->real_parent);
+    if (parent)
+        bpf_probe_read_kernel(&h->ppid, sizeof(h->ppid), &parent->tgid);
+    bpf_probe_read_kernel(&h->start_ns, sizeof(h->start_ns), &t->start_time);
+    bpf_probe_read_kernel_str(h->comm, sizeof(h->comm), &t->comm);
+}
+
+/* TP_PROTO(struct task_struct *parent, struct task_struct *child)
+ * `parent` is always `current`, the creator - even with CLONE_PARENT, where
+ * the child's real_parent is the creator's parent. */
+RAW_TRACEPOINT_PROBE(sched_process_fork)
+{
+    struct task_struct *creator = (struct task_struct *)ctx->args[0];
+    struct task_struct *child = (struct task_struct *)ctx->args[1];
+    u32 pid = 0, tgid = 0;
+
+    bpf_probe_read_kernel(&pid, sizeof(pid), &child->pid);
+    bpf_probe_read_kernel(&tgid, sizeof(tgid), &child->tgid);
+    if (pid != tgid)
+        return 0;                       /* new thread, not a new process */
+    exited.delete(&tgid);               /* PID reused: allow its EXIT again */
+
+    struct hdr_t *h = events.ringbuf_reserve(sizeof(struct hdr_t));
+    if (!h) { count_drop(); return 0; }
+    fill(h, child, EV_FORK);
+    bpf_probe_read_kernel(&h->ppid, sizeof(h->ppid), &creator->tgid);
+    events.ringbuf_submit(h, 0);
+    return 0;
+}
+
+/* TP_PROTO(struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm) */
+RAW_TRACEPOINT_PROBE(sched_process_exec)
+{
+    struct task_struct *t = (struct task_struct *)ctx->args[0];
+    struct linux_binprm *bprm = (struct linux_binprm *)ctx->args[2];
+    struct signal_struct *sig = NULL;
+    struct tty_struct *tty = NULL;
+    struct mm_struct *mm = NULL;
+    const char *fn = NULL;
+    unsigned long start = 0, end = 0;
+    int leader = 0;
+    int zero = 0;
+
+    /* Built in per-CPU scratch space, sent with only the argv bytes used. */
+    struct exec_t *e = exec_scratch.lookup(&zero);
+    if (!e)
+        return 0;
+    fill(&e->h, t, EV_EXEC);
+
+    /* Interactive shells: session leader with a controlling terminal. */
+    bpf_probe_read_kernel(&sig, sizeof(sig), &t->signal);
+    if (sig) {
+        bpf_probe_read_kernel(&leader, sizeof(leader), &sig->leader);
+        bpf_probe_read_kernel(&tty, sizeof(tty), &sig->tty);
+    }
+    if (leader && tty)
+        e->h.flags |= F_TTY_LEADER;
+
+    /* interp == filename, except for binfmts that load an interpreter (scripts). */
+    e->binary[0] = 0;
+    bpf_probe_read_kernel(&fn, sizeof(fn), &bprm->interp);
+    if (fn)
+        bpf_probe_read_kernel_str(e->binary, sizeof(e->binary), fn);
+
+    /* The new argv was just copied to the new stack, so it is paged in. */
+    bpf_probe_read_kernel(&mm, sizeof(mm), &t->mm);
+    if (mm) {
+        bpf_probe_read_kernel(&start, sizeof(start), &mm->arg_start);
+        bpf_probe_read_kernel(&end, sizeof(end), &mm->arg_end);
+    }
+    u64 total = end > start ? end - start : 0;
+    u32 len = total < ARGSIZE ? total : ARGSIZE - 1;
+    len &= ARGSIZE - 1;                 /* bound for the verifier */
+    u32 copied = 0;
+    if (len && bpf_probe_read_user(e->args, len, (void *)start) == 0)
+        copied = len;
+    e->args_total = total;
+    e->args_len = copied;
+
+    u32 size = __builtin_offsetof(struct exec_t, args) + (copied & (ARGSIZE - 1));
+    if (events.ringbuf_output(e, size, 0) != 0)
+        count_drop();
+    return 0;
+}
+
+/* TP_PROTO(struct task_struct *p[, bool group_dead]) - fired once per thread
+ * (group_dead exists on newer kernels only, so the `live` counter below is used
+ * for portability) */
+RAW_TRACEPOINT_PROBE(sched_process_exit)
+{
+    struct task_struct *t = (struct task_struct *)ctx->args[0];
+    struct task_struct *leader = NULL;
+    struct signal_struct *sig = NULL;
+    unsigned int flags = 0;
+    int live = 1;
+    u32 tgid = 0;
+    u8 one = 1;
+
+    bpf_probe_read_kernel(&sig, sizeof(sig), &t->signal);
+    if (!sig)
+        return 0;
+    bpf_probe_read_kernel(&live, sizeof(live), &sig->live.counter);
+    if (live != 0)
+        return 0;                       /* other threads still running */
+    /* `live` is decremented early in do_exit(), so several threads exiting
+     * concurrently can all see 0 here. Only the first one reports. */
+    bpf_probe_read_kernel(&tgid, sizeof(tgid), &t->tgid);
+    if (exited.insert(&tgid, &one) != 0)
+        return 0;
+
+    struct hdr_t *h = events.ringbuf_reserve(sizeof(struct hdr_t));
+    if (!h) { count_drop(); return 0; }
+    fill(h, t, EV_EXIT);
+
+    /* `t` may be any thread; process-level data lives in the group leader. */
+    bpf_probe_read_kernel(&leader, sizeof(leader), &t->group_leader);
+    if (leader) {
+        bpf_probe_read_kernel(&h->start_ns, sizeof(h->start_ns), &leader->start_time);
+        bpf_probe_read_kernel_str(h->comm, sizeof(h->comm), &leader->comm);
+    }
+    /* Same rule as wait_task_zombie(). */
+    bpf_probe_read_kernel(&flags, sizeof(flags), &sig->flags);
+    if (flags & SIGNAL_GROUP_EXIT)
+        bpf_probe_read_kernel(&h->exit_code, sizeof(h->exit_code), &sig->group_exit_code);
+    else if (leader)
+        bpf_probe_read_kernel(&h->exit_code, sizeof(h->exit_code), &leader->exit_code);
+
+    events.ringbuf_submit(h, 0);
+    return 0;
+}
+"""
+
+
+class Header(ct.Structure):
+    _fields_ = [
+        ("ts", ct.c_uint64),
+        ("start_ns", ct.c_uint64),
+        ("type", ct.c_uint32),
+        ("pid", ct.c_uint32),
+        ("ppid", ct.c_uint32),
+        ("uid", ct.c_uint32),
+        ("exit_code", ct.c_int32),
+        ("flags", ct.c_uint32),
+        ("comm", ct.c_char * TASK_COMM_LEN),
+    ]
+
+
+class ExecTail(ct.Structure):  # follows Header in EXEC events, then args[]
+    _fields_ = [
+        ("args_len", ct.c_uint32),
+        ("args_total", ct.c_uint32),
+        ("binary", ct.c_char * BINARY_LEN),
+    ]
+
+
+EXEC_ARGS_OFFSET = ct.sizeof(Header) + ct.sizeof(ExecTail)
+
+
+def bpf_program(arg_bytes: int, pages: int) -> str:
+    return BPF_PROGRAM.replace("__ARGSIZE__", str(arg_bytes)).replace("__PAGES__", str(pages))
+
+
+def parse_exec(addr: int, size: int) -> tuple[tuple[bytes, ...], bool, bytes]:
+    """Return (argv, truncated, binary) from an EXEC event."""
+    if size < EXEC_ARGS_OFFSET:
+        return (), False, b""
+    tail = ExecTail.from_address(addr + ct.sizeof(Header))
+    n = min(tail.args_len, size - EXEC_ARGS_OFFSET)
+    raw = ct.string_at(addr + EXEC_ARGS_OFFSET, n).removesuffix(b"\0")
+    argv = tuple(raw.split(b"\0")) if raw else ()
+    return argv, tail.args_total > n, tail.binary
+
+# ---------------------------------------------------------------------- /proc
+
+
+class Stat(NamedTuple):
+    ppid: int
+    state: str
+    comm: str
+    tty_leader: bool  # session leader with a controlling terminal
+
+
+def read_stat(pid: int) -> Stat | None:
+    """Parse /proc/<pid>/stat (also works for thread IDs)."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    # comm may contain spaces and parentheses: it ends at the LAST ')'.
+    lpar, rpar = data.find(b"("), data.rfind(b")")
+    fields = data[rpar + 2:].split()  # state ppid pgrp session tty_nr ...
+    try:
+        comm = data[lpar + 1:rpar].decode("utf-8", "backslashreplace")
+        return Stat(ppid=int(fields[1]), state=fields[0].decode(), comm=comm,
+                    tty_leader=int(fields[3]) == pid and int(fields[4]) != 0)
+    except (IndexError, ValueError):
+        return None
+
+
+def read_cmdline(pid: int) -> str:
+    """Arguments joined by spaces, like pgrep -f ('' for kernel threads and zombies)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return ""
+    return os.fsdecode(raw.rstrip(b"\0").replace(b"\0", b" "))
+
+
+def read_exe(pid: int) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+
+
+def exe_candidates(pid: int, *paths: bytes) -> list[str]:
+    """Resolved /proc/PID/exe plus any path as passed to exec."""
+    exes = [os.fsdecode(p) for p in paths if p]
+    if (exe := read_exe(pid)) is not None:
+        exes.append(exe)
+    return exes
+
+
+def any_thread_alive(pid: int) -> bool:
+    """A zombie group leader can still have running threads."""
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return False
+    return any((st := read_stat(int(tid))) is not None and st.state not in DEAD_STATES
+               for tid in tids if tid.isdigit())
+
+
+def read_tgid(pid: int) -> int | None:
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("Tgid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def iter_pids() -> Iterator[int]:
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            yield int(name)
+
+# -------------------------------------------------------------------- matching
+
+
+class Matcher:
+    """pgrep-like patterns on a process's name, command line or executable path."""
+
+    def __init__(self, patterns: dict[str, list[str]], *, fixed: bool = False,
+                 exact: bool = False, ignore_case: bool = False) -> None:
+        flags = re.IGNORECASE if ignore_case else 0
+        self.tests: dict[str, list[Callable[[str], re.Match[str] | None]]] = {}
+        for field, pats in patterns.items():
+            for pat in pats:
+                rx = re.compile(re.escape(pat) if fixed else pat, flags)
+                self.tests.setdefault(field, []).append(rx.fullmatch if exact else rx.search)
+
+    def __bool__(self) -> bool:
+        return bool(self.tests)
+
+    def matches(self, comm: str, cmdline: Callable[[], str],
+                exes: Callable[[], Iterable[str]]) -> bool:
+        """`cmdline` and `exes` are only called if a pattern needs them."""
+        values: dict[str, Callable[[], Iterable[str]]] = {
+            "comm": lambda: (comm,),
+            "cmdline": lambda: (cmdline() or comm,),  # kernel threads: fall back to the name
+            "exe": exes,
+        }
+        return any(test(value)
+                   for field, tests in self.tests.items()
+                   for value in values[field]()
+                   for test in tests)
+
+# ---------------------------------------------------------------- process tree
+
+
+class Proc:
+    """A process. `parent` is a strong reference: a dead process stays in memory
+    exactly as long as a still-known descendant points to it."""
+
+    __slots__ = ("pid", "comm", "parent", "root", "descendant", "shown",  # noqa: RUF023
+                 "tty_leader")
+
+    def __init__(self, pid: int, comm: str, parent: Proc | None, root: bool = False,
+                 tty_leader: bool = False) -> None:
+        self.pid = pid
+        self.comm = comm
+        self.parent = parent
+        self.root = root
+        # Decided once, at creation; inherited along the fork chain.
+        self.descendant = parent is not None and (parent.root or parent.descendant)
+        # True once a FORK/EXEC line for this process was really printed
+        # (not dimmed by --show-hidden); used by --paired and --top-level.
+        self.shown = False
+        # Session leader with a controlling terminal (interactive shell); stops --top-level.
+        self.tty_leader = tty_leader
+
+    def covered(self, strict: bool) -> bool:
+        """An ancestor's start line was printed. Without `strict`, the walk stops
+        at the nearest interactive session leader, so terminals/SSH sessions
+        opened after startup don't swallow everything typed in them."""
+        p = self.parent
+        while p is not None:
+            if not strict and p.tty_leader:
+                break
+            if p.shown:
+                return True
+            p = p.parent
+        return False
+
+
+class ProcessTree:
+    def __init__(self, roots: set[int], matcher: Matcher) -> None:
+        self.roots = set(roots)          # -P root PIDs that are still running
+        self.matcher = matcher
+        self.live: dict[int, Proc] = {}  # tgid -> currently running process
+
+    def seed(self) -> set[int]:
+        """Load all existing processes from /proc. Returns -P roots that weren't found."""
+        stats = {pid: st for pid in iter_pids() if (st := read_stat(pid)) is not None}
+        for pid in stats:
+            self._resolve(pid, stats.get)
+        for pid, st in stats.items():
+            if st.state in DEAD_STATES and not any_thread_alive(pid):
+                self.live.pop(pid, None)  # already exited; only kept as an ancestor
+        missing = self.roots - self.live.keys()
+        self.roots -= missing
+        return missing
+
+    def _is_root(self, pid: int, comm: str) -> bool:
+        """Root status of a process loaded from /proc."""
+        return pid in self.roots or (bool(self.matcher) and self.matcher.matches(
+            comm, lambda: read_cmdline(pid), lambda: exe_candidates(pid)))
+
+    def _resolve(self, pid: int, get_stat: Callable[[int], Stat | None]) -> Proc | None:
+        """Create `pid` and any unknown ancestors from stat data (iterative, no depth limit)."""
+        target, chain, seen = pid, [], set()
+        while pid > 0 and pid not in self.live and pid not in seen:
+            st = get_stat(pid)
+            if st is None:
+                break
+            chain.append((pid, st))
+            seen.add(pid)
+            pid = st.ppid
+        parent = self.live.get(pid)
+        for p, st in reversed(chain):
+            parent = self.live[p] = Proc(p, st.comm, parent, root=self._is_root(p, st.comm),
+                                         tty_leader=st.tty_leader)
+        return self.live.get(target)
+
+    def lookup(self, pid: int) -> Proc | None:
+        """Known live process, or (degraded path, e.g. after lost events) load it from /proc."""
+        return self.live.get(pid) or self._resolve(pid, read_stat)
+
+    def fork(self, pid: int, creator: int, comm: str) -> Proc:
+        # Always a new object: a reused PID never inherits the old process's identity.
+        # No matching needed: the child is a copy of its creator.
+        node = self.live[pid] = Proc(pid, comm, self.lookup(creator))
+        return node
+
+    def exec(self, pid: int, ppid: int, comm: str, argv: tuple[bytes, ...],
+             binary: bytes, tty_leader: bool) -> Proc:
+        node = self.lookup(pid)
+        if node is None:
+            node = self.live[pid] = Proc(pid, comm, self.lookup(ppid))
+        node.comm = comm
+        node.tty_leader = tty_leader
+        # Sticky: once matched, everything the process starts from now on is covered,
+        # even if it later execs something that doesn't match.
+        if not (node.root or node.descendant) and self.matcher and self.matcher.matches(
+                comm, lambda: os.fsdecode(b" ".join(argv)),
+                lambda: exe_candidates(pid, binary)):
+            node.root = True
+        return node
+
+    def exit(self, pid: int, ppid: int, comm: str) -> Proc:
+        node = self.live.pop(pid, None)
+        if node is None:
+            return Proc(pid, comm, self.lookup(ppid))
+        self.roots.discard(pid)  # a later process reusing this PID is not a root
+        return node
+
+    def reconcile(self) -> None:
+        """After lost events: drop entries whose exit we may have missed."""
+        for pid in [p for p in self.live if not os.path.exists(f"/proc/{p}")]:
+            del self.live[pid]
+
+# ------------------------------------------------------------------ formatting
+
+
+RESET, BOLD, DIM = "0", "1", "2"
+RED, GREEN, YELLOW, BLUE = "31", "32", "33", "34"
+EVENT_STYLE = {EV_FORK: (BLUE,), EV_EXEC: (GREEN,), EV_EXIT: (YELLOW,)}
+
+
+class Style:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def __call__(self, text: str, *codes: str) -> str:
+        if not (self.enabled and codes):
+            return text
+        return f"\x1b[{';'.join(codes)}m{text}\x1b[{RESET}m"
+
+
+def _escape_char(c: str) -> str:
+    o = ord(c)
+    if 0xDC80 <= o <= 0xDCFF:  # undecodable byte, via surrogateescape
+        return f"\\x{o - 0xDC00:02x}"
+    if c.isprintable():
+        return c
+    return f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
+
+
+def shell_quote(arg: bytes) -> str:
+    """Quote an argument so it can be pasted into a shell; never emits raw control chars."""
+    s = os.fsdecode(arg)
+    if s.isprintable():
+        return shlex.quote(s)
+    return "$'" + "".join("\\" + c if c in "\\'" else _escape_char(c) for c in s) + "'"
+
+
+def sanitize(text: str) -> str:
+    """Process names are attacker-controlled: never send raw escape sequences to the terminal."""
+    return text if text.isprintable() else "".join(map(_escape_char, text))
+
+
+def describe_exit(code: int) -> tuple[str, bool]:
+    sig = code & 0x7F
+    if sig:
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f"signal {sig}"
+        return name + (" (core dumped)" if code & 0x80 else ""), True
+    status = (code >> 8) & 0xFF
+    return f"exit {status}", status != 0
+
+
+def fmt_duration(ns: int) -> str:
+    s = ns / 1e9
+    if s < 1:
+        return f"{s * 1e3:.1f}ms"
+    if s < 60:
+        return f"{s:.2f}s"
+    m, sec = divmod(int(s), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m{sec:02d}s" if h else f"{m}m{sec:02d}s"
+
+
+class Event(NamedTuple):
+    kind: int
+    ts: int
+    pid: int
+    ppid: int
+    uid: int
+    comm: str
+    exit_code: int
+    start_ns: int
+    argv: tuple[bytes, ...]
+    truncated: bool
+    binary: bytes
+
+
+class Formatter:
+    def __init__(self, args: argparse.Namespace, color: bool, t0: int) -> None:
+        self.style = Style(color)
+        self.plain = Style(False)
+        self.time_mode = args.time
+        self.uid = args.uid
+        self.pcomm = args.pcomm
+        self.exe = args.exe
+        self.t0 = t0  # rel-time origin, captured before any event can arrive
+        self.mono_to_wall = time.time_ns() - time.monotonic_ns()
+
+    def _time(self, ts: int) -> str:
+        if self.time_mode == "rel":
+            return f"{(ts - self.t0) / 1e9:>10.3f}"
+        wall = (ts + self.mono_to_wall) / 1e9
+        return time.strftime("%H:%M:%S", time.localtime(wall)) + f".{int(wall * 1000) % 1000:03d}"
+
+    def header(self) -> str:
+        cols = []
+        if self.time_mode == "wall":
+            cols.append(f"{'TIME':<12}")
+        elif self.time_mode == "rel":
+            cols.append(f"{'TIME(s)':>10}")
+        cols += [f"{'EVENT':<5}", f"{'PID':>7}", f"{'PPID':>7}"]
+        if self.uid:
+            cols.append(f"{'UID':>6}")
+        cols.append(f"{'COMM':<16}")
+        if self.pcomm:
+            cols.append(f"{'PCOMM':<16}")
+        cols.append("DETAILS")
+        return self.style(" ".join(cols), BOLD)
+
+    def line(self, ev: Event, node: Proc, dimmed: bool) -> str:
+        s = self.plain if dimmed else self.style
+        cols = []
+        if self.time_mode != "none":
+            cols.append(s(self._time(ev.ts), DIM))
+        label = EVENT_LABEL[ev.kind] + ("*" if dimmed else " ")
+        cols.append(s(label, *EVENT_STYLE[ev.kind]))
+        # PPID = creating process (survives reparenting); kernel's value as fallback.
+        ppid = node.parent.pid if node.parent is not None else ev.ppid
+        cols.append(f"{ev.pid:>7}")
+        cols.append(s(f"{ppid:>7}", DIM))
+        if self.uid:
+            cols.append(f"{ev.uid:>6}")
+        cols.append(s(f"{sanitize(ev.comm):<16}", BOLD))
+        if self.pcomm:
+            pcomm = sanitize(node.parent.comm) if node.parent is not None else "?"
+            cols.append(s(f"{pcomm:<16}", DIM))
+        cols.append(self._details(ev, s))
+        text = " ".join(cols).rstrip()
+        return self.style(text, DIM) if dimmed else text
+
+    def _details(self, ev: Event, s: Style) -> str:
+        if ev.kind == EV_EXEC:
+            text = " ".join(map(shell_quote, ev.argv)) or shell_quote(ev.binary)
+            if ev.truncated:
+                text += s("…", DIM)
+            if self.exe and ev.binary and (not ev.argv or ev.binary != ev.argv[0]):
+                text += " " + s(f"[{shell_quote(ev.binary)}]", DIM)
+            return text
+        if ev.kind == EV_EXIT:
+            desc, failed = describe_exit(ev.exit_code)
+            text = s(desc, BOLD, RED) if failed else desc
+            if ev.start_ns and ev.ts > ev.start_ns:
+                text += "  " + s(f"after {fmt_duration(ev.ts - ev.start_ns)}", DIM)
+            return text
+        return ""
+
+# --------------------------------------------------------------------- snooper
+
+
+class Snooper:
+    def __init__(self, args: argparse.Namespace, tree: ProcessTree, fmt: Formatter) -> None:
+        self.tree = tree
+        self.fmt = fmt
+        self.events = args.events
+        self.only = args.only
+        self.include_roots = args.roots
+        self.show_hidden = args.show_hidden
+        self.paired = args.paired
+        self.top_level = args.top_level
+        self.strict = args.strict and args.top_level
+        self.out = sys.stdout
+
+    def on_event(self, _ctx, data, size) -> None:
+        addr = ct.cast(data, ct.c_void_p).value
+        h = Header.from_address(addr)
+        kind, pid, ppid = h.type, h.pid, h.ppid
+        comm = h.comm.decode("utf-8", "backslashreplace")
+        argv: tuple[bytes, ...] = ()
+        truncated, binary = False, b""
+
+        # Always update the tree, whether or not this event type is printed.
+        if kind == EV_FORK:
+            node = self.tree.fork(pid, ppid, comm)
+        elif kind == EV_EXEC:
+            argv, truncated, binary = parse_exec(addr, size)
+            node = self.tree.exec(pid, ppid, comm, argv, binary,
+                                  tty_leader=bool(h.flags & F_TTY_LEADER))
+        elif kind == EV_EXIT:
+            node = self.tree.exit(pid, ppid, comm)
+        else:
+            return
+
+        if kind not in self.events:
+            return
+        if self.paired and kind == EV_EXIT and not node.shown:
+            return                      # its start was never printed
+        selected = node.descendant or (self.include_roots and node.root)
+        hidden = selected != self.only
+        # Top-level: hide subprocesses of printed processes. A process that was already
+        # printed stays printed (re-exec, its EXIT), even if an ancestor got printed later.
+        if not hidden and self.top_level and not node.shown and node.covered(self.strict):
+            hidden = True
+        if hidden and not self.show_hidden:
+            return
+
+        ev = Event(kind, h.ts, pid, ppid, h.uid, comm, h.exit_code, h.start_ns,
+                   argv, truncated, binary)
+        self.out.write(self.fmt.line(ev, node, dimmed=hidden) + "\n")
+        if not hidden and kind != EV_EXIT:
+            node.shown = True
+
+# ------------------------------------------------------------------------- CLI
+
+
+def warn(msg: str) -> None:
+    print(f"{PROG}: warning: {msg}", file=sys.stderr)
+
+
+def info(msg: str) -> None:
+    print(f"{PROG}: {msg}", file=sys.stderr)
+
+
+def pid_list(text: str) -> list[int]:
+    try:
+        pids = [int(p) for p in text.split(",") if p.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid PID list: {text!r}") from None
+    if not pids or any(p <= 0 for p in pids):
+        raise argparse.ArgumentTypeError(f"PIDs must be positive integers: {text!r}")
+    return pids
+
+
+def event_list(text: str) -> frozenset[int]:
+    names = {n.strip().upper() for n in text.split(",") if n.strip()}
+    if "ALL" in names:
+        return frozenset(EVENT_BY_NAME.values())
+    unknown = names - EVENT_BY_NAME.keys()
+    if unknown or not names:
+        raise argparse.ArgumentTypeError(
+            f"unknown event(s) {', '.join(sorted(unknown)) or text!r}; "
+            f"choose from {', '.join(EVENT_BY_NAME)}, ALL")
+    return frozenset(EVENT_BY_NAME[n] for n in names)
+
+
+def power_of_two(lo: int, hi: int) -> Callable[[str], int]:
+    def parse(text: str) -> int:
+        try:
+            n = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not an integer: {text!r}") from None
+        if not lo <= n <= hi or n & (n - 1):
+            raise argparse.ArgumentTypeError(f"must be a power of two in [{lo}, {hi}]")
+        return n
+    return parse
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Trace process fork/exec/exit, hiding (or showing only) the subtrees "
+                    "of given PIDs or of processes matching patterns.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=EXAMPLES,
+    )
+    sel = p.add_argument_group("root selection (-P and patterns can be combined)")
+    sel.add_argument("-P", "--pid", type=pid_list, action="extend", default=[],
+                     metavar="PID[,PID...]",
+                     help="roots: PID(s) whose subtree is hidden (or, with -o, shown); "
+                          "comma-separated, repeatable")
+    sel.add_argument("-m", "--match", action="append", default=[], metavar="PATTERN",
+                     help="roots: processes whose name (comm, max. 15 chars) matches, like pgrep")
+    sel.add_argument("-f", "--match-full", action="append", default=[], metavar="PATTERN",
+                     help="roots: processes whose command line (arguments joined by spaces) "
+                          "matches, like pgrep -f")
+    sel.add_argument("-X", "--match-exe", action="append", default=[], metavar="PATTERN",
+                     help="roots: processes whose executable matches (the loaded binary: "
+                          "/proc/PID/exe, or the interpreter for scripts)")
+    sel.add_argument("-F", "--fixed-strings", action="store_true",
+                     help="patterns are literal strings, not regular expressions")
+    sel.add_argument("-x", "--exact", action="store_true",
+                     help="patterns must match the whole value (like pgrep -x)")
+    sel.add_argument("-i", "--ignore-case", action="store_true",
+                     help="match patterns case-insensitively")
+    sel.add_argument("-o", "--only", action="store_true",
+                     help="invert: print only the subtrees instead of hiding them")
+    sel.add_argument("-r", "--roots", dest="roots", action="store_true", default=True,
+                     help="count the root processes themselves as part of their subtrees "
+                          "(default)")
+    sel.add_argument("-R", "--no-roots", dest="roots", action="store_false", default=True,
+                     help="filter only the descendants; the roots are treated like any "
+                          "other process")
+
+    out = p.add_argument_group("output")
+    out.add_argument("-e", "--events", type=event_list, default=frozenset({EV_EXEC, EV_EXIT}),
+                     metavar="EV[,EV...]",
+                     help="events to print: FORK, EXEC, EXIT or ALL (default: EXEC,EXIT); "
+                          "all three are always traced internally")
+    out.add_argument("-T", "--top-level", action="store_true",
+                     help="print only processes none of whose ancestors were printed "
+                          "(scripts and programs, not their subprocesses); interactive "
+                          "shells don't count as printed ancestors")
+    out.add_argument("--strict", action="store_true",
+                     help="with -T: interactive shells count as printed ancestors too; "
+                          "any session opened after startup hides everything run in it")
+    out.add_argument("--paired", dest="paired", action="store_true", default=None,
+                     help="print EXIT only for processes whose FORK or EXEC line was printed "
+                          "(default whenever --events allows it)")
+    out.add_argument("--no-paired", dest="paired", action="store_false", default=None,
+                     help="print every EXIT that passes the filters")
+    out.add_argument("--show-hidden", action="store_true",
+                     help="print filtered lines too, dimmed and marked with '*' (debugging)")
+    out.add_argument("-t", "--time", choices=("wall", "rel", "none"), default="wall",
+                     help="timestamp column: wall (HH:MM:SS.mmm), rel (seconds since the "
+                          "trace started) or none (default: wall)")
+    out.add_argument("-U", "--uid", action="store_true", help="add a UID column")
+    out.add_argument("-M", "--pcomm", action="store_true",
+                     help="add the parent's name (from the tracked tree, works for dead parents)")
+    out.add_argument("--exe", action="store_true",
+                     help="show the loaded binary when it differs from argv[0]")
+    out.add_argument("--color", nargs="?", const="always", default="auto",
+                     choices=("auto", "always", "never"), help="colorize output (default: auto)")
+    out.add_argument("--no-header", action="store_true", help="don't print the column header")
+
+    misc = p.add_argument_group("tuning")
+    misc.add_argument("--arg-bytes", type=power_of_two(256, 16384), default=4096, metavar="N",
+                      help="max bytes of argv captured per exec, power of two (default: 4096)")
+    misc.add_argument("--buffer-pages", type=power_of_two(16, 65536), default=1024, metavar="N",
+                      help="ring buffer size in pages, power of two (default: 1024 = 4 MiB)")
+    misc.add_argument("--no-sudo", action="store_true",
+                      help="don't re-run through sudo when not root; fail instead")
+
+    args = p.parse_args(argv)
+    try:
+        args.matcher = Matcher(
+            {"comm": args.match, "cmdline": args.match_full, "exe": args.match_exe},
+            fixed=args.fixed_strings, exact=args.exact, ignore_case=args.ignore_case)
+    except re.error as e:
+        p.error(f"invalid regular expression {e.pattern!r}: {e}")
+    if args.only and not (args.pid or args.matcher):
+        p.error("--only requires -P or a pattern (-m, -f, -X)")
+
+    has_start = bool(args.events & {EV_FORK, EV_EXEC})
+    can_pair = EV_EXIT in args.events and has_start
+    if args.paired is None:
+        args.paired = can_pair          # default on, but only where it makes sense
+    elif args.paired and not can_pair:
+        p.error("--paired needs EXIT and at least one of FORK, EXEC in --events")
+    if args.top_level and not has_start:
+        p.error("--top-level needs FORK or EXEC in --events")
+    if args.strict and not args.top_level:
+        p.error("--strict only makes sense with --top-level")
+    return args
+
+
+def want_color(mode: str, stream) -> bool:
+    if mode != "auto":
+        return mode == "always"
+    return stream.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def resolve_roots(pids: list[int]) -> set[int]:
+    roots = set()
+    for pid in pids:
+        tgid = read_tgid(pid)
+        if tgid is None:
+            sys.exit(f"{PROG}: no such process: {pid}")
+        if tgid != pid:
+            warn(f"{pid} is a thread; using its process {tgid}")
+        roots.add(tgid)
+    return roots
+
+
+def reexec_with_sudo(args: argparse.Namespace, argv: list[str]) -> NoReturn:
+    sudo = shutil.which("sudo")
+    if sudo is None:
+        sys.exit(f"{PROG}: must be run as root (sudo not found)")
+
+    # Added before the user's arguments so a user-supplied '--' can't swallow them.
+    extra = ["--no-sudo"]  # the child must never try to elevate again
+    if args.color == "auto":
+        # sudo strips most of the environment (NO_COLOR included), so decide here.
+        extra.append(f"--color={'always' if want_color('auto', sys.stdout) else 'never'}")
+
+    warn("not running as root; re-running with sudo")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    python = sys.executable or "python3"
+    script = os.path.abspath(__file__)
+    os.execv(sudo, [sudo, "--", python, script, *extra, *argv])
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    args = parse_args(argv)
+    if importlib.util.find_spec("bcc") is None:  # fail before the password prompt
+        sys.exit(BCC_MISSING)
+    if os.geteuid() != 0:
+        if args.no_sudo:
+            sys.exit(f"{PROG}: must be run as root")
+        reexec_with_sudo(args, argv)
+    try:
+        from bcc import BPF
+    except ImportError as e:
+        sys.exit(f"{BCC_MISSING}: {e}")
+
+    roots = resolve_roots(args.pid)
+
+    # 1. Attach first: from here on, every fork/exec/exit is queued in the ring buffer.
+    t0 = time.monotonic_ns()  # rel-time origin, taken before any event can arrive
+    bpf = BPF(text=bpf_program(args.arg_bytes, args.buffer_pages))
+    # 2. Then snapshot /proc, so processes that already exist are covered.
+    tree = ProcessTree(roots, args.matcher)
+    for pid in sorted(tree.seed()):
+        warn(f"root process {pid} exited during startup")
+    if args.matcher:
+        matched = sum(1 for n in tree.live.values() if n.root and n.pid not in tree.roots)
+        info(f"{matched} running process(es) match the pattern(s)")
+
+    fmt = Formatter(args, want_color(args.color, sys.stdout), t0)
+    snooper = Snooper(args, tree, fmt)
+
+    stop = False
+
+    def request_stop(*_: object) -> None:
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quietly die on `| head`
+
+    # 3. Only now consume the queued events.
+    bpf["events"].open_ring_buffer(snooper.on_event)
+    if not args.no_header:
+        print(fmt.header(), flush=True)
+
+    dropped = bpf["dropped"]
+    reported = 0
+    while not stop:
+        bpf.ring_buffer_poll(timeout=250)
+        sys.stdout.flush()
+        lost = dropped[0].value
+        if lost != reported:
+            warn(f"{lost - reported} event(s) lost (ring buffer full); "
+                 "lineage may be incomplete - consider a larger --buffer-pages")
+            tree.reconcile()
+            reported = lost
+    bpf.ring_buffer_consume()
+    sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:  # e.g. Ctrl-C while BCC is still compiling
+        sys.exit(130)
