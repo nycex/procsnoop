@@ -1,4 +1,5 @@
 # procsnoop
+[![AUR](https://img.shields.io/badge/AUR-procsnoop-1793D1?style=for-the-badge&logo=archlinux)](https://aur.archlinux.org/packages/procsnoop)
 
 mostly "vibecoded" version of `{exec,exit}snoop` featuring (non-exhaustive):
 - fancier formatting (colors etc.)
@@ -8,7 +9,8 @@ mostly "vibecoded" version of `{exec,exit}snoop` featuring (non-exhaustive):
 - get FORK, EXEC and EXIT events (and see how long proc ran until EXIT) in a single chronological output
 - select which events to output
 
-[![AUR](https://img.shields.io/badge/AUR-procsnoop-1793D1?style=for-the-badge&logo=archlinux)](https://aur.archlinux.org/packages/procsnoop)
+## demo
+![demo](https://asciinema.org/a/j6vgpIgR8cdSMgHR.svg)
 
 ## requirements
 
