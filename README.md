@@ -10,7 +10,7 @@ mostly "vibecoded" version of `{exec,exit}snoop` featuring (non-exhaustive):
 - select which events to output
 
 ## demo
-![demo](https://asciinema.org/a/j6vgpIgR8cdSMgHR.svg)
+[![demo](https://asciinema.org/a/j6vgpIgR8cdSMgHR.svg)](https://asciinema.org/a/j6vgpIgR8cdSMgHR)
 
 ## requirements
 
